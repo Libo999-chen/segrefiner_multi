@@ -8,7 +8,7 @@ import cv2
 
 
 def map_to_6_classes(mask, idx=None):
-    new_mask = np.ones_like(mask, dtype=np.uint8) * 255  # ignore
+    new_mask = np.ones_like(mask, dtype=np.uint8) * 5  # other
 
     # based on Cityscapes trainIds
     mapping = {
@@ -16,8 +16,7 @@ def map_to_6_classes(mask, idx=None):
         8: 1,   # sidewalk
         11: 2,  # building
         21: 3,  # vegetation
-        23: 4,  # sky
-        26: 5   # car
+        26: 4   # car
     }
 
     for k, v in mapping.items():
@@ -43,11 +42,8 @@ def generate_coarse_mask(mask, num_classes=6):
     noise = np.random.randint(0, num_classes, size=mask.shape)
     prob = np.random.rand(*mask.shape)
 
-    valid = (mask != 255)
-    corrupt_region = (band > 0) & (prob < 0.3) & valid
+    corrupt_region = (band > 0) & (prob < 0.3)
     mask[corrupt_region] = noise[corrupt_region]
-
-
 
     return mask
 

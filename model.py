@@ -124,7 +124,6 @@ class UNet_Diffusion(nn.Module):
         self,
         in_ch=3,
         num_classes=6,
-        mask_emb_dim=32,
         time_dim=64,
         base_ch=128,
         ignore_index=255,
@@ -132,14 +131,11 @@ class UNet_Diffusion(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.ignore_index = ignore_index
-        self.ignore_token = num_classes  # extra embedding slot for ignore
 
-        # +1 slot for ignore token
-        self.xt_emb = nn.Embedding(num_classes + 1, mask_emb_dim)
-        self.coarse_emb = nn.Embedding(num_classes + 1, mask_emb_dim)
         self.time_embed = TimeEmbedding(time_dim=time_dim)
 
-        total_in_ch = in_ch + mask_emb_dim + mask_emb_dim
+        
+        total_in_ch = in_ch + num_classes + num_classes
         # Encoder
         self.d1 = ResidualBlock(total_in_ch, base_ch, time_dim=time_dim)          # H
         self.p1 = nn.MaxPool2d(2)
@@ -165,17 +161,26 @@ class UNet_Diffusion(nn.Module):
         self.c1 = ResidualBlock(base_ch * 2, base_ch, time_dim=time_dim)
 
         self.outc = nn.Conv2d(base_ch, num_classes, kernel_size=1)
-
-    def _prepare_mask_indices(self, mask):
+    
+    def _mask_to_onehot(self, mask):
         """
-        Map ignore label 255 -> num_classes, clamp invalid values safely.
+        mask: [B,H,W], ignore=255
+        return: [B,num_classes,H,W]
         """
         mask = mask.clone().long()
-        mask[mask == self.ignore_index] = self.ignore_token
-        valid_max = self.num_classes - 1
-        mask[(mask < 0) & (mask != self.ignore_token)] = self.ignore_token
-        mask[(mask > valid_max) & (mask != self.ignore_token)] = self.ignore_token
-        return mask
+        valid = (mask != self.ignore_index)
+
+        safe_mask = mask.clone()
+        safe_mask[~valid] = 0
+        safe_mask = safe_mask.clamp(0, self.num_classes - 1)
+
+        onehot = F.one_hot(safe_mask, num_classes=self.num_classes)  # [B,H,W,K]
+        onehot = onehot.permute(0, 3, 1, 2).float()                  # [B,K,H,W]
+        onehot = onehot * valid.unsqueeze(1).float()
+
+        return onehot
+
+
 
     def forward(self, img, coarse, xt, t):
         if img.dim() != 4:
@@ -185,14 +190,13 @@ class UNet_Diffusion(nn.Module):
         if xt.dim() != 3:
             raise ValueError(f"xt must have shape [B,H,W], got {xt.shape}")
 
-        coarse_idx = self._prepare_mask_indices(coarse)
-        xt_idx = self._prepare_mask_indices(xt)
-
-        coarse_emb = self.coarse_emb(coarse_idx).permute(0, 3, 1, 2)
-        xt_emb = self.xt_emb(xt_idx).permute(0, 3, 1, 2)
+        coarse_oh = self._mask_to_onehot(coarse)   # [B,K,H,W]
+        xt_oh = self._mask_to_onehot(xt)           # [B,K,H,W]
         t_emb = self.time_embed(t)
 
-        x = torch.cat([img, coarse_emb, xt_emb], dim=1)
+        x = torch.cat([img, coarse_oh, xt_oh], dim=1)
+
+
 
         x1 = self.d1(x, t_emb)
         x2 = self.d2(self.p1(x1), t_emb)
@@ -216,5 +220,6 @@ class UNet_Diffusion(nn.Module):
             up1 = F.interpolate(up1, size=x1.shape[-2:], mode="bilinear", align_corners=False)
         up1 = self.c1(torch.cat([up1, x1], dim=1), t_emb)
 
-        logits = self.outc(up1)
+        residual_logits = self.outc(up1)
+        logits = self.outc(up1) + xt_oh
         return logits

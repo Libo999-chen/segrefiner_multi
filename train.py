@@ -14,14 +14,13 @@ os.makedirs("/home/lc2762/segrefiner_multi/runs/checkpoints", exist_ok=True)
 # ================================================================
 def cdd_forward(mask, t, K=6, lam=0.3):
     """
-    mask: [H, W] with values in {0, ..., K-1, 255}
+    mask: [H, W] with values in {0, ..., K-1}
     """
     x = mask.clone()
 
     for _ in range(t):
         jump = (torch.rand_like(x.float()) < lam).long()
-        valid = (x != 255)
-        x[valid] = (x[valid] + jump[valid]) % K
+        x = (x + jump) % K
 
     return x
 
@@ -67,13 +66,10 @@ def true_two_point_posterior(x0, xt, t_scalar, K, lam):
     device = x0.device
     probs_tm1 = binom_mod_probs(t_scalar - 1, K, lam, device)  # q_{t-1}
 
-    valid = (x0 != 255) & (xt != 255)
+    valid = torch.ones_like(x0, dtype=torch.bool)
 
-    # for invalid pixels, fill with 0 temporarily
-    x0v = x0.clone()
-    xtv = xt.clone()
-    x0v[~valid] = 0
-    xtv[~valid] = 0
+    x0v = x0
+    xtv = xt
 
     # q_{t-1}(x_t | x_0)
     offset_stay = (xtv - x0v) % K
@@ -90,8 +86,7 @@ def true_two_point_posterior(x0, xt, t_scalar, K, lam):
     q_stay = ((1 - lam) * q_prev_to_xt) / denom
     q_jump = (lam * q_prev_to_xt_minus_1) / denom
 
-    q_stay[~valid] = 0.0
-    q_jump[~valid] = 0.0
+
     return q_stay, q_jump, valid
 
 
@@ -115,9 +110,7 @@ def predicted_two_point_posterior_from_x0_logits(logits, xt, t_scalar, K, lam):
     px0 = F.softmax(logits, dim=0)  # [K, H, W]
 
     H, W = xt.shape
-    xtv = xt.clone()
-    valid = (xtv != 255)
-    xtv[~valid] = 0
+    xtv = xt
 
     p_stay = torch.zeros((H, W), device=device, dtype=torch.float32)
     p_jump = torch.zeros((H, W), device=device, dtype=torch.float32)
@@ -140,8 +133,6 @@ def predicted_two_point_posterior_from_x0_logits(logits, xt, t_scalar, K, lam):
         p_stay += px0[a] * w_stay
         p_jump += px0[a] * w_jump
 
-    p_stay[~valid] = 0.0
-    p_jump[~valid] = 0.0
 
     # numerical cleanup
     s = p_stay + p_jump + 1e-12
@@ -182,15 +173,12 @@ def posterior_kl_loss(logits, x0, xt, t, K=6, lam=0.3):
 # ================================================================
 # Evaluation metrics
 # ================================================================
-def IoU_numpy(pred, gt, num_classes=6, ignore_index=255):
+def IoU_numpy(pred, gt, num_classes=6):
     """
     Compute mean IoU over classes present in gt/pred, ignoring ignore_index.
     pred, gt: [H, W] numpy arrays
     """
-    valid = (gt != ignore_index)
 
-    pred = pred[valid]
-    gt = gt[valid]
 
     ious = []
     for c in range(num_classes):
@@ -209,18 +197,12 @@ def IoU_numpy(pred, gt, num_classes=6, ignore_index=255):
     return float(np.mean(ious))
 
 
-def extract_boundary(mask, ignore_index=255):
-    """
-    Extract semantic boundaries from a label mask.
-    A pixel is boundary if any 4-neighbor has a different valid label.
-    Returns binary boundary map of shape [H, W], dtype uint8.
-    """
+def extract_boundary(mask):
     H, W = mask.shape
     boundary = np.zeros((H, W), dtype=np.uint8)
 
-    valid = (mask != ignore_index)
+    valid = np.ones_like(mask, dtype=bool)
 
-    # up/down differences
     diff_down = (
         valid[:-1, :] & valid[1:, :] &
         (mask[:-1, :] != mask[1:, :])
@@ -228,7 +210,6 @@ def extract_boundary(mask, ignore_index=255):
     boundary[:-1, :] |= diff_down.astype(np.uint8)
     boundary[1:, :]  |= diff_down.astype(np.uint8)
 
-    # left/right differences
     diff_right = (
         valid[:, :-1] & valid[:, 1:] &
         (mask[:, :-1] != mask[:, 1:])
@@ -239,16 +220,9 @@ def extract_boundary(mask, ignore_index=255):
     return boundary
 
 
-def BFScore(pred, gt, ignore_index=255, tolerance=2):
-    """
-    Boundary F-score with pixel tolerance.
-    pred, gt: [H, W] numpy arrays
-
-    A predicted boundary pixel is correct if it lies within `tolerance`
-    pixels of a ground-truth boundary pixel, and vice versa.
-    """
-    pred_b = extract_boundary(pred, ignore_index=ignore_index)
-    gt_b = extract_boundary(gt, ignore_index=ignore_index)
+def BFScore(pred, gt, tolerance=2):
+    pred_b = extract_boundary(pred)
+    gt_b = extract_boundary(gt)
 
     pred_b = pred_b.astype(np.uint8)
     gt_b = gt_b.astype(np.uint8)
@@ -265,11 +239,9 @@ def BFScore(pred, gt, ignore_index=255, tolerance=2):
     gt_dil = cv2.dilate(gt_b, kernel)
     pred_dil = cv2.dilate(pred_b, kernel)
 
-    # precision: fraction of predicted boundary matched by GT boundary
     pred_match = (pred_b > 0) & (gt_dil > 0)
     precision = pred_match.sum() / (pred_b.sum() + 1e-8)
 
-    # recall: fraction of GT boundary matched by predicted boundary
     gt_match = (gt_b > 0) & (pred_dil > 0)
     recall = gt_match.sum() / (gt_b.sum() + 1e-8)
 
@@ -305,13 +277,13 @@ lam = 0.3
 
 # 推荐先用 CE + 小权重 KL，更稳定
 alpha_ce = 1.0
-alpha_kl = 0.01
+alpha_kl = 0.001
 
 
 # ================================================================
 # TRAINING
 # ================================================================
-for epoch in range(100):
+for epoch in range(20):
     model.train()
     total_loss = 0.0
     total_ce = 0.0
@@ -327,7 +299,7 @@ for epoch in range(100):
         # ---- sample timestep ----
         t = torch.randint(1, T + 1, (B,), device=device)
 
-        # ---- forward diffusion from coarse ----
+        # ---- forward diffusion from gt ----
         xt = torch.stack([
             cdd_forward(gt[i], int(t[i]), K, lam)
             for i in range(B)
@@ -341,7 +313,15 @@ for epoch in range(100):
         logits = model(img, coarse, xt, t_norm)
 
         # ---- L0: direct x0 reconstruction ----
-        ce_loss = F.cross_entropy(logits, gt, ignore_index=255)
+
+        pixel_loss = F.cross_entropy(logits, gt, reduction='none')
+
+        refine_mask = (coarse != gt)
+
+        weight = torch.ones_like(pixel_loss)
+        weight[refine_mask] = 4.0
+
+        ce_loss = (pixel_loss * weight).mean()
 
         # ---- Lt-1: reverse posterior KL ----
         kl_loss = posterior_kl_loss(logits, gt, xt, t, K=K, lam=lam)
@@ -363,16 +343,29 @@ for epoch in range(100):
         f"kl = {total_kl / len(train_loader):.6f}"
     )
     # ===== save every 10 epochs =====
-    if (epoch + 1) % 50 == 0:
-        torch.save(model.state_dict(), f"/home/lc2762/segrefiner_multi/runs/checkpoints/model_epoch_{epoch+1}__akl{alpha_ce}.pth")
+    if (epoch + 1) % 10 == 0:
+        torch.save(model.state_dict(), f"/home/lc2762/segrefiner_multi/runs/checkpoints/model_epoch_{epoch+1}__akl{alpha_kl}_standard6.pth")
         print(f"✅ Saved model at epoch {epoch+1}")
 
 
 # ================================================================
 # EVALUATION
 # ================================================================
-model.eval()
 
+def reverse_one_step(logits, xt, t_scalar, K=6, lam=0.3):
+    B, _, H, W = logits.shape
+    x_prev = xt.clone()
+
+    for i in range(B):
+        p_stay, p_jump = predicted_two_point_posterior_from_x0_logits(
+            logits[i], xt[i], t_scalar, K, lam
+        )
+        jump = (p_jump > p_stay) 
+        x_prev[i][jump] = (xt[i][jump] - 1) % K
+
+    return x_prev
+
+model.eval()
 all_IoU, all_BF = [], []
 
 with torch.no_grad():
@@ -383,13 +376,15 @@ with torch.no_grad():
 
         B = img.size(0)
 
+        # refinement: start from coarse
         xt = coarse.clone()
-        t = torch.ones(B, device=device, dtype=torch.long)
-        logits = model(img, coarse, xt, t.float() / T)
-        
 
+        for step in range(T, 0, -1):
+            t = torch.full((B,), step, device=device, dtype=torch.long)
+            logits = model(img, coarse, xt, t.float() / T)
+            xt = reverse_one_step(logits, xt, step, K=K, lam=lam)
 
-        pred = torch.argmax(logits, dim=1).cpu().numpy()
+        pred = xt.cpu().numpy()
         gt_np = gt.cpu().numpy()
 
         for i in range(B):
