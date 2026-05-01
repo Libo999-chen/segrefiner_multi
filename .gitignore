@@ -7,3 +7,6 @@ data/
 *.history
 .vscode/
 
+cityscapes/
+third_party/
+CLAUDE.md

@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 import cv2
-
 from data import Cityscapes6ClassRefinement
 from model import UNet_Diffusion
 import os
@@ -171,84 +170,104 @@ def posterior_kl_loss(logits, x0, xt, t, K=6, lam=0.3):
     return total_kl / (total_valid + 1e-12)
 
 # ================================================================
+# Boundary-aware texture loss
+#   L_tex = alpha * || S(p_theta) - S(x_0) ||_1
+#   S(u)  = sqrt( (K_x * f_m(u))^2 + (K_y * f_m(u))^2 + eps )
+#   f_m   : 3x3 mean filter,  K_x/K_y: Sobel kernels
+# Multi-class extension: applied per-class on softmax probs vs one-hot GT.
+# ================================================================
+_SOBEL_X = torch.tensor([[-1., 0., 1.],
+                         [-2., 0., 2.],
+                         [-1., 0., 1.]])
+_SOBEL_Y = torch.tensor([[-1., -2., -1.],
+                         [ 0.,  0.,  0.],
+                         [ 1.,  2.,  1.]])
+
+
+def boundary_texture_loss(logits, gt, K=6, eps=1e-6):
+    """
+    logits: [B, K, H, W]
+    gt    : [B, H, W] long in {0,...,K-1}
+    """
+    device = logits.device
+    C = logits.size(1)
+
+    probs = F.softmax(logits, dim=1)  # [B, K, H, W]
+    gt_oh = F.one_hot(gt.clamp(0, K - 1), num_classes=K).permute(0, 3, 1, 2).float()
+
+    mean_k = torch.ones(C, 1, 3, 3, device=device) / 9.0
+    sobel_x = _SOBEL_X.to(device).view(1, 1, 3, 3).expand(C, 1, 3, 3).contiguous()
+    sobel_y = _SOBEL_Y.to(device).view(1, 1, 3, 3).expand(C, 1, 3, 3).contiguous()
+
+    p_m = F.conv2d(probs, mean_k, padding=1, groups=C)
+    g_m = F.conv2d(gt_oh, mean_k, padding=1, groups=C)
+
+    p_S = torch.sqrt(F.conv2d(p_m, sobel_x, padding=1, groups=C) ** 2 +
+                     F.conv2d(p_m, sobel_y, padding=1, groups=C) ** 2 + eps)
+    g_S = torch.sqrt(F.conv2d(g_m, sobel_x, padding=1, groups=C) ** 2 +
+                     F.conv2d(g_m, sobel_y, padding=1, groups=C) ** 2 + eps)
+
+    return F.l1_loss(p_S, g_S)
+
+
+# ================================================================
 # Evaluation metrics
 # ================================================================
-def IoU_numpy(pred, gt, num_classes=6):
-    """
-    Compute mean IoU over classes present in gt/pred, ignoring ignore_index.
-    pred, gt: [H, W] numpy arrays
-    """
-
-
-    ious = []
+def iou_update(inter, union, pred, gt, num_classes=6):
+    """Accumulate per-class intersection/union counts for one image."""
     for c in range(num_classes):
-        pred_c = (pred == c)
-        gt_c = (gt == c)
-
-        union = np.logical_or(pred_c, gt_c).sum()
-        if union == 0:
-            continue  # skip absent classes
-
-        inter = np.logical_and(pred_c, gt_c).sum()
-        ious.append(inter / (union + 1e-8))
-
-    if len(ious) == 0:
-        return 0.0
-    return float(np.mean(ious))
+        pc = (pred == c)
+        gc = (gt == c)
+        inter[c] += int(np.logical_and(pc, gc).sum())
+        union[c] += int(np.logical_or(pc, gc).sum())
 
 
-def extract_boundary(mask):
-    H, W = mask.shape
-    boundary = np.zeros((H, W), dtype=np.uint8)
-
-    valid = np.ones_like(mask, dtype=bool)
-
-    diff_down = (
-        valid[:-1, :] & valid[1:, :] &
-        (mask[:-1, :] != mask[1:, :])
-    )
-    boundary[:-1, :] |= diff_down.astype(np.uint8)
-    boundary[1:, :]  |= diff_down.astype(np.uint8)
-
-    diff_right = (
-        valid[:, :-1] & valid[:, 1:] &
-        (mask[:, :-1] != mask[:, 1:])
-    )
-    boundary[:, :-1] |= diff_right.astype(np.uint8)
-    boundary[:, 1:]  |= diff_right.astype(np.uint8)
-
-    return boundary
+def iou_reduce(inter, union):
+    """Mean IoU over classes with union > 0 (dataset-aggregated)."""
+    ious = [inter[c] / union[c] for c in range(len(inter)) if union[c] > 0]
+    return float(np.mean(ious)) if ious else 0.0
 
 
-def BFScore(pred, gt, tolerance=2):
-    pred_b = extract_boundary(pred)
-    gt_b = extract_boundary(gt)
+def _class_boundary(mask, c):
+    """1-pixel-thick inner boundary of class c: pixels of class c adjacent to non-c."""
+    cls = (mask == c).astype(np.uint8)
+    if cls.sum() == 0:
+        return cls
+    not_cls = (1 - cls).astype(np.uint8)
+    not_cls_dil = cv2.dilate(not_cls, np.ones((3, 3), np.uint8))
+    return (cls & not_cls_dil).astype(np.uint8)
 
-    pred_b = pred_b.astype(np.uint8)
-    gt_b = gt_b.astype(np.uint8)
 
-    if pred_b.sum() == 0 and gt_b.sum() == 0:
-        return 1.0
-    if pred_b.sum() == 0 or gt_b.sum() == 0:
-        return 0.0
-
+def BFScore(pred, gt, num_classes=6, tolerance=2):
+    """Per-class F1 between class-c contours in pred and gt, averaged over present classes."""
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (2 * tolerance + 1, 2 * tolerance + 1)
     )
 
-    gt_dil = cv2.dilate(gt_b, kernel)
-    pred_dil = cv2.dilate(pred_b, kernel)
+    f1s = []
+    for c in range(num_classes):
+        pb = _class_boundary(pred, c)
+        gb = _class_boundary(gt, c)
 
-    pred_match = (pred_b > 0) & (gt_dil > 0)
-    precision = pred_match.sum() / (pred_b.sum() + 1e-8)
+        ps, gs = pb.sum(), gb.sum()
+        if ps == 0 and gs == 0:
+            continue  # class absent in both — skip
+        if ps == 0 or gs == 0:
+            f1s.append(0.0)
+            continue
 
-    gt_match = (gt_b > 0) & (pred_dil > 0)
-    recall = gt_match.sum() / (gt_b.sum() + 1e-8)
+        gb_dil = cv2.dilate(gb, kernel)
+        pb_dil = cv2.dilate(pb, kernel)
 
-    if precision + recall == 0:
-        return 0.0
+        precision = ((pb > 0) & (gb_dil > 0)).sum() / (ps + 1e-8)
+        recall    = ((gb > 0) & (pb_dil > 0)).sum() / (gs + 1e-8)
 
-    return float(2 * precision * recall / (precision + recall + 1e-8))
+        if precision + recall == 0:
+            f1s.append(0.0)
+        else:
+            f1s.append(2 * precision * recall / (precision + recall + 1e-8))
+
+    return float(np.mean(f1s)) if f1s else 0.0
 
 
 # ================================================================
@@ -256,13 +275,18 @@ def BFScore(pred, gt, tolerance=2):
 # ================================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+coarse_dirname = "coarseMask_m2f_badorder"
+coarse_tag = coarse_dirname.removeprefix("coarseMask_")
+
 train_dataset = Cityscapes6ClassRefinement(
     root="/home/lc2762/segrefiner_multi/data",
-    split="train"
+    split="train",
+    coarse_dirname=coarse_dirname,
 )
 val_dataset = Cityscapes6ClassRefinement(
     root="/home/lc2762/segrefiner_multi/data",
-    split="val"
+    split="val",
+    coarse_dirname=coarse_dirname,
 )
 
 train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=4)
@@ -271,6 +295,16 @@ val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=4)
 model = UNet_Diffusion(num_classes=6).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=1e-4)
 
+# ---- resume from epoch-30 checkpoint ----
+#ckpt_path = "/home/lc2762/segrefiner_multi/runs/checkpoints/dlv3p_mixedxt_model_epoch_30__akl0.001.pth"
+#model.load_state_dict(torch.load(ckpt_path, map_location=device))
+# start_epoch = 30
+# end_epoch = 120
+# print(f"✅ Resumed from {ckpt_path}, training {start_epoch} → {end_epoch}")
+start_epoch = 0
+end_epoch = 120           # 上限，实际由早停决定
+print(f"✅ Training from scratch, {start_epoch} → {end_epoch} (with early stopping)")
+
 K = 6
 T = 16
 lam = 0.3
@@ -278,16 +312,27 @@ lam = 0.3
 # 推荐先用 CE + 小权重 KL，更稳定
 alpha_ce = 1.0
 alpha_kl = 0.001
+alpha_tex = 5
+
+# ---- early stopping ----
+patience = 15                  # 连续多少个 epoch 没有相对改进就停
+min_rel_delta = 1e-3           # 相对下降阈值 (loss_new < best * (1 - min_rel_delta) 才算改进)
+best_loss = float("inf")
+epochs_since_improve = 0
+# best_ckpt_path = f"/home/lc2762/segrefiner_multi/runs/checkpoints/{coarse_tag}_mixedxt_best__akl{alpha_kl}.pth"
+best_ckpt_path = f"/home/lc2762/segrefiner_multi/runs/checkpoints/{coarse_tag}_mixedxt_best__akl{alpha_kl}.pth"
+save_every = 50
 
 
 # ================================================================
 # TRAINING
 # ================================================================
-for epoch in range(20):
+for epoch in range(start_epoch, end_epoch):
     model.train()
     total_loss = 0.0
     total_ce = 0.0
     total_kl = 0.0
+    total_tex = 0.0
 
     for img, coarse, gt in train_loader:
         img = img.to(device)
@@ -299,9 +344,19 @@ for epoch in range(20):
         # ---- sample timestep ----
         t = torch.randint(1, T + 1, (B,), device=device)
 
-        # ---- forward diffusion from gt ----
+        # ---- forward diffusion from gt (x0) ----
+        # xt = torch.stack([
+        #     cdd_forward(gt[i], int(t[i]), K, lam)
+        #     for i in range(B)
+        # ])
+
+        # 50% of samples: xt = coarse with t=T, so the model sees the
+        # real test-time input distribution during training.
+        use_coarse = torch.rand(B, device=device) < 0.5
+        t = torch.where(use_coarse, torch.full_like(t, T), t)
+
         xt = torch.stack([
-            cdd_forward(gt[i], int(t[i]), K, lam)
+            coarse[i].clone() if bool(use_coarse[i]) else cdd_forward(gt[i], int(t[i]), K, lam)
             for i in range(B)
         ])
 
@@ -314,38 +369,62 @@ for epoch in range(20):
 
         # ---- L0: direct x0 reconstruction ----
 
-        pixel_loss = F.cross_entropy(logits, gt, reduction='none')
-
-        refine_mask = (coarse != gt)
-
-        weight = torch.ones_like(pixel_loss)
-        weight[refine_mask] = 4.0
-
-        ce_loss = (pixel_loss * weight).mean()
+        ce_per_pixel = F.cross_entropy(logits, gt, reduction='none')
+        weight = torch.where(coarse != gt, 4.0, 1.0)
+        ce_loss = (ce_per_pixel * weight).mean()
 
         # ---- Lt-1: reverse posterior KL ----
         kl_loss = posterior_kl_loss(logits, gt, xt, t, K=K, lam=lam)
 
-        loss = alpha_ce * ce_loss + alpha_kl * kl_loss
+        # ---- boundary-aware texture loss ----
+        tex_loss = boundary_texture_loss(logits, gt, K=K)
+
+        loss = alpha_ce * ce_loss + alpha_kl * kl_loss + alpha_tex * tex_loss
 
         opt.zero_grad()
         loss.backward()
         opt.step()
 
         total_loss += loss.item()
-        total_ce += ce_loss.item()
-        total_kl += kl_loss.item()
+        total_ce += (alpha_ce * ce_loss).item()
+        total_kl += (alpha_kl * kl_loss).item()
+        total_tex += (alpha_tex * tex_loss).item()
 
+    avg_loss = total_loss / len(train_loader)
     print(
         f"[Epoch {epoch}] "
-        f"loss = {total_loss / len(train_loader):.6f}, "
+        f"loss = {avg_loss:.6f}, "
         f"ce = {total_ce / len(train_loader):.6f}, "
-        f"kl = {total_kl / len(train_loader):.6f}"
+        f"kl = {total_kl / len(train_loader):.6f}, "
+        f"tex = {total_tex / len(train_loader):.6f}"
     )
-    # ===== save every 10 epochs =====
-    if (epoch + 1) % 10 == 0:
-        torch.save(model.state_dict(), f"/home/lc2762/segrefiner_multi/runs/checkpoints/model_epoch_{epoch+1}__akl{alpha_kl}_standard6.pth")
-        print(f"✅ Saved model at epoch {epoch+1}")
+
+    # ---- early stopping & best checkpoint ----
+    if avg_loss < best_loss * (1 - min_rel_delta):
+        best_loss = avg_loss
+        epochs_since_improve = 0
+        torch.save(model.state_dict(), best_ckpt_path)
+        print(f"  ↳ new best loss {best_loss:.6f}, saved → {best_ckpt_path}")
+    else:
+        epochs_since_improve += 1
+        print(f"  ↳ no improvement ({epochs_since_improve}/{patience}), best = {best_loss:.6f}")
+
+    # ---- periodic checkpoint every `save_every` epochs ----
+    if (epoch + 1) % save_every == 0:
+        # periodic_path = (
+        #     f"/home/lc2762/segrefiner_multi/runs/checkpoints/"
+        #     f"{coarse_tag}_mixedxt_epoch_{epoch + 1}__akl{alpha_kl}.pth"
+        # )
+        periodic_path = (
+            f"/home/lc2762/segrefiner_multi/runs/checkpoints/"
+            f"{coarse_tag}_mixedxt_epoch_{epoch + 1}__akl{alpha_kl}.pth"
+        )
+        torch.save(model.state_dict(), periodic_path)
+        print(f"  ↳ periodic checkpoint saved → {periodic_path}")
+
+    if epochs_since_improve >= patience:
+        print(f"⏹  Early stop at epoch {epoch} (no improvement for {patience} epochs). Best loss = {best_loss:.6f}")
+        break
 
 
 # ================================================================
@@ -365,8 +444,15 @@ def reverse_one_step(logits, xt, t_scalar, K=6, lam=0.3):
 
     return x_prev
 
+# load best-loss checkpoint for evaluation
+if os.path.exists(best_ckpt_path):
+    model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
+    print(f"✅ Loaded best checkpoint for eval: {best_ckpt_path} (loss={best_loss:.6f})")
+
 model.eval()
-all_IoU, all_BF = [], []
+inter = np.zeros(K, dtype=np.int64)
+union = np.zeros(K, dtype=np.int64)
+all_BF = []
 
 with torch.no_grad():
     for img, coarse, gt in val_loader:
@@ -377,7 +463,9 @@ with torch.no_grad():
         B = img.size(0)
 
         # refinement: start from coarse
-        xt = coarse.clone()
+        #xt = coarse.clone()
+        xt = torch.randint(0, K, coarse.shape, device=device)  # x_T 从均匀分布采样
+
 
         for step in range(T, 0, -1):
             t = torch.full((B,), step, device=device, dtype=torch.long)
@@ -388,9 +476,9 @@ with torch.no_grad():
         gt_np = gt.cpu().numpy()
 
         for i in range(B):
-            all_IoU.append(IoU_numpy(pred[i], gt_np[i]))
-            all_BF.append(BFScore(pred[i], gt_np[i]))
+            iou_update(inter, union, pred[i], gt_np[i], num_classes=K)
+            all_BF.append(BFScore(pred[i], gt_np[i], num_classes=K))
 
 print("\n==== RESULTS ====")
-print(f"IoU ↑     {np.mean(all_IoU):.6f}")
+print(f"IoU ↑     {iou_reduce(inter, union):.6f}")
 print(f"BFScore ↑ {np.mean(all_BF):.6f}")

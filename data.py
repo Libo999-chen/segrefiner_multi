@@ -4,20 +4,29 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as transforms
-import cv2
 
 
 def map_to_6_classes(mask, idx=None):
     new_mask = np.ones_like(mask, dtype=np.uint8) * 5  # other
 
-    # based on Cityscapes trainIds
+    # based on Cityscapes labelIds (from gtFine_labelIds.png)
     mapping = {
-        7: 0,   # road
-        8: 1,   # sidewalk
-        11: 2,  # building
-        21: 3,  # vegetation
-        26: 4   # car
+        7: 0,    # road
+        8: 1,    # sidewalk
+        11: 2,   # building
+        21: 3,   # vegetation
+        26: 4,   # car
+        -1: 5,   # other
     }
+    # bad order
+    # mapping = {
+    #     7: 0,    # road
+    #     21: 1,   # vegetation
+    #     8: 2,    # sidewalk
+    #     26: 3,   # car
+    #     11: 4,   # building
+    #     -1: 5,   # other
+    # }
 
     for k, v in mapping.items():
         new_mask[mask == k] = v
@@ -28,40 +37,23 @@ def map_to_6_classes(mask, idx=None):
     return new_mask
 
 
-def generate_coarse_mask(mask, num_classes=6):
-    mask = mask.copy()
-
-    h, w = mask.shape
-    small = cv2.resize(mask, (w // 4, h // 4), interpolation=cv2.INTER_NEAREST)
-    mask = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-
-    edges = cv2.Canny(mask.astype(np.uint8), 0, 1)
-    kernel = np.ones((5, 5), np.uint8)
-    band = cv2.dilate(edges, kernel)
-
-    noise = np.random.randint(0, num_classes, size=mask.shape)
-    prob = np.random.rand(*mask.shape)
-
-    corrupt_region = (band > 0) & (prob < 0.3)
-    mask[corrupt_region] = noise[corrupt_region]
-
-    return mask
-
-
 class Cityscapes6ClassRefinement(Dataset):
-    def __init__(self, root, split="train", size=(256, 256)):
+    def __init__(self, root, split="train", size=(256, 256),
+                 coarse_dirname="coarseMask_m2f"):
         self.root = root
         self.split = split
         self.size = size
 
         self.img_dir = os.path.join(root, "leftImg8bit", split)
         self.gt_dir = os.path.join(root, "gtFine", split)
+        self.coarse_dir = os.path.join(root, coarse_dirname, split)
 
-        self.images, self.masks = [], []
+        self.images, self.masks, self.coarses = [], [], []
 
         for city in sorted(os.listdir(self.img_dir)):
             img_folder = os.path.join(self.img_dir, city)
             gt_folder = os.path.join(self.gt_dir, city)
+            coarse_folder = os.path.join(self.coarse_dir, city)
 
             if not os.path.isdir(img_folder) or not os.path.isdir(gt_folder):
                 continue
@@ -69,13 +61,19 @@ class Cityscapes6ClassRefinement(Dataset):
             for f in sorted(os.listdir(img_folder)):
                 if f.endswith("_leftImg8bit.png"):
                     img_path = os.path.join(img_folder, f)
-                    
-                    mask_name = f.replace("_leftImg8bit.png", "_gtFine_labelIds.png")
-                    mask_path = os.path.join(gt_folder, mask_name)
+                    mask_path = os.path.join(
+                        gt_folder,
+                        f.replace("_leftImg8bit.png", "_gtFine_labelIds.png"),
+                    )
+                    coarse_path = os.path.join(
+                        coarse_folder,
+                        f.replace("_leftImg8bit.png", "_coarse6.png"),
+                    )
 
-                    if os.path.exists(mask_path):
+                    if os.path.exists(mask_path) and os.path.exists(coarse_path):
                         self.images.append(img_path)
                         self.masks.append(mask_path)
+                        self.coarses.append(coarse_path)
 
         self.image_transform = transforms.Compose([
             transforms.Resize(size, interpolation=Image.LANCZOS),
@@ -94,16 +92,14 @@ class Cityscapes6ClassRefinement(Dataset):
     def __getitem__(self, idx):
         img = Image.open(self.images[idx]).convert("RGB")
         mask = np.array(Image.open(self.masks[idx]), dtype=np.uint8)
-        #print("unique raw mask:", np.unique(mask))
+        coarse = np.array(Image.open(self.coarses[idx]), dtype=np.uint8)
 
         mask = map_to_6_classes(mask, idx)
 
         img = self.image_transform(img)
-        mask = Image.fromarray(mask)
-        mask = self.mask_resize(mask)
-        mask = np.array(mask, dtype=np.uint8)
 
-        coarse = generate_coarse_mask(mask)
+        mask = np.array(self.mask_resize(Image.fromarray(mask)), dtype=np.uint8)
+        coarse = np.array(self.mask_resize(Image.fromarray(coarse)), dtype=np.uint8)
 
         mask = torch.from_numpy(mask).long()
         coarse = torch.from_numpy(coarse).long()
